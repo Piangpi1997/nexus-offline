@@ -8,6 +8,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 URL = os.environ.get("NEXUS_TEST_URL", "http://127.0.0.1:4174/")
+ROOT = Path(__file__).resolve().parents[1]
 INIT = r"""
 (() => {
   window.__attachmentCalls=[];
@@ -69,29 +70,37 @@ with sync_playwright() as p:
     long_description="ဖိုင်လုံခြုံရေးအတွက် AES-GCM encryption နှင့် SHA-256 integrity ကိုအသုံးပြုထားသည်။ Nearby transfer progress/cancel၊ QR pairing၊ Local AI နှင့် physical-device/10-phone verification ဆိုင်ရာ mixed technical metadata ကို မျက်နှာပြင်ကျဉ်းသော်လည်း သဘာဝအတိုင်း wrap လုပ်ရမည်။ "*2
     description=layout_card.locator(".attachment-description")
     description.evaluate("(e,text)=>{e.textContent=text}",long_description)
+    page.wait_for_timeout(3300)  # Allow transient startup notices to clear before evidence capture.
     for width in (320,360,390,412,480):
         page.set_viewport_size({"width":width,"height":900})
         page.wait_for_function("document.querySelector('#sidebar').getBoundingClientRect().right <= 0.5", timeout=1500)
         layout=layout_card.evaluate("""card=>{
           const box=e=>{const r=e.getBoundingClientRect();return {left:r.left,right:r.right,top:r.top,bottom:r.bottom,width:r.width,height:r.height}};
-          const d=card.querySelector('.attachment-description'),a=card.querySelector('.attachment-actions');
-          return {viewport:innerWidth,scrollWidth:document.documentElement.scrollWidth,card:box(card),description:box(d),descriptionWidth:d.clientWidth,descriptionScrollWidth:d.scrollWidth,actions:box(a),buttons:[...a.querySelectorAll('button')].map(box)};
+          const title=card.querySelector('.attachment-meta > strong'),meta=card.querySelector('.attachment-meta'),d=card.querySelector('.attachment-description'),status=card.querySelector('.attachment-integrity'),a=card.querySelector('.attachment-actions');
+          const cardStyle=getComputedStyle(card);
+          return {viewport:innerWidth,scrollWidth:document.documentElement.scrollWidth,card:box(card),cardBorder:cardStyle.borderTopWidth,cardRadius:cardStyle.borderRadius,title:box(title),meta:box(meta),description:box(d),descriptionWidth:d.clientWidth,descriptionHeight:d.clientHeight,descriptionScrollWidth:d.scrollWidth,descriptionScrollHeight:d.scrollHeight,descriptionOverflowY:getComputedStyle(d).overflowY,status:box(status),actions:box(a),actionsPosition:getComputedStyle(a).position,actionNames:[...a.querySelectorAll('button')].map(e=>e.dataset.attachmentAction),buttons:[...a.querySelectorAll('button')].map(box)};
         }""")
         assert layout["scrollWidth"] <= width, f"attachment page horizontal overflow at {width}px: {layout}"
         assert layout["descriptionScrollWidth"] <= layout["descriptionWidth"] + 1, f"attachment description does not wrap at {width}px: {layout}"
-        assert layout["actions"]["top"] >= layout["description"]["bottom"] + 16, f"attachment description overlaps or crowds actions at {width}px: {layout}"
+        assert layout["descriptionScrollHeight"] <= layout["descriptionHeight"] + 4 and layout["descriptionOverflowY"] not in ("hidden","clip"), f"Burmese/English attachment description is vertically clipped at {width}px: {layout}"
+        assert layout["title"]["top"] <= layout["description"]["top"] <= layout["status"]["top"] <= layout["status"]["bottom"] <= layout["meta"]["bottom"], f"attachment title/description/status order changed at {width}px: {layout}"
+        assert layout["cardBorder"] == "0px" and layout["cardRadius"] == "0px", f"attachment content should be borderless inside its section container at {width}px: {layout}"
+        assert layout["actionsPosition"] == "static", f"attachment actions are not in normal flow at {width}px: {layout}"
+        assert layout["actions"]["top"] >= layout["meta"]["bottom"] + 16, f"attachment status overlaps or crowds actions at {width}px: {layout}"
         assert layout["actions"]["left"] >= layout["card"]["left"] - 1 and layout["actions"]["right"] <= layout["card"]["right"] + 1, f"attachment action row escapes its card at {width}px: {layout}"
+        assert layout["actionNames"] == ["open","share","export","delete"], f"attachment action data attributes changed at {width}px: {layout}"
         if width in (320,390):
-            evidence=Path(__file__).resolve().parents[1] / "ui-validation" / "after"
+            evidence=ROOT / "ui-validation" / "after"
             evidence.mkdir(parents=True,exist_ok=True)
-            page.screenshot(path=str(evidence/f"attachment-actions-{width}.png"),full_page=True)
+            page.screenshot(path=str(evidence/f"attachment-{width}.png"),full_page=True)
         for i,button in enumerate(layout["buttons"]):
             assert button["width"] >= 44 and button["height"] >= 44, f"attachment action below 44px at {width}px: {layout}"
             for other in layout["buttons"][i+1:]:
                 separated=button["right"] <= other["left"]+1 or other["right"] <= button["left"]+1 or button["bottom"] <= other["top"]+1 or other["bottom"] <= button["top"]+1
                 assert separated, f"attachment action buttons overlap at {width}px: {layout}"
-    print("PASS: attachment description wraps above actions with >=16px separation at 320, 360, 390, 412, and 480px")
+    print("PASS: attachment title -> long mixed Burmese/English description -> integrity status -> >=16px gap -> static-flow actions at all five mobile widths")
     print("PASS: attachment action row stays inside its card; buttons are >=44px and do not overlap")
+    print("PASS: attachment action data attributes remain open/share/export/delete; before/after screenshots at 320px and 390px")
     assert not errors,"browser errors: "+repr(errors)
     print("PASS: untrusted attachment filename rendered as inert text")
     print("PASS: only GCM/SHA-256 verified attachments enable open/share/export")

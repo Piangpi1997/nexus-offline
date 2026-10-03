@@ -989,7 +989,7 @@
     $('#create-group').addEventListener('click',createOfflineGroup);
     $('#group-action-button').addEventListener('click',manageActiveGroup);
     $('.room-info').addEventListener('click',showRoomInfo);
-    $('#pair-qr').addEventListener('click',()=>{const result=bridgeJson(bridgeCall('createPairingQr'));if(!result?.ok)toast(`QR ပြုလုပ်မရပါ · ${result?.error||'Native Android လိုအပ်သည်'}`);});
+    $('#pair-qr').addEventListener('click',()=>{const result=bridgeJson(bridgeCall('createPairingQr',state.language==='en'?'en':'my'));if(!result?.ok)toast(`QR ပြုလုပ်မရပါ · ${result?.error||'Native Android လိုအပ်သည်'}`);});
     $('#scan-pair-qr').addEventListener('click',()=>{const result=bridgeJson(bridgeCall('scanPairingQr'));if(!result?.ok)toast(`QR scan မစတင်နိုင်ပါ · ${result?.error||'Native Android လိုအပ်သည်'}`);});
     $('#refresh-attachments').addEventListener('click',refreshAttachments);
     $('#retry-attachment-migration').addEventListener('click',()=>{const result=bridgeJson(bridgeCall('retryAttachmentMigration'));if(!result?.ok)toast('Legacy migration ပြန်မစနိုင်ပါ');else toast('Legacy plaintext attachment migration ကို ထပ်စစ်နေသည်');});

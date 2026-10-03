@@ -47,6 +47,10 @@ internal interface LocalAIEngine {
     fun generate(prompt: String): String
     fun cancelGeneration(): Boolean
     fun unloadModel(): Boolean
+    /** Releases native memory and temporary plaintext synchronously on a worker thread after pressure. */
+    fun releaseForMemoryPressure() {
+        if (!cancelGeneration()) unloadModel()
+    }
     fun deleteModel(modelId: String): String
     fun close()
 }

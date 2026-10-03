@@ -11,6 +11,13 @@ internal data class PairingQrPayload(
     val endpointData: String = PairingQr.BOOTSTRAP_SERVICE_ID
 )
 
+internal data class PairingQrScanResult(
+    val payload: PairingQrPayload? = null,
+    val errorCode: String? = null
+) {
+    val ok: Boolean get() = payload != null && errorCode == null
+}
+
 internal object PairingQr {
     const val PROTOCOL_VERSION = 1
     const val TTL_MILLIS = 120_000L
@@ -55,6 +62,15 @@ internal object PairingQr {
         }.getOrNull()
     }
 
+    /** Validates scanner output without mutating the caller's nonce set or exposing QR contents. */
+    fun scan(raw: String?, nowMillis: Long, usedNonces: Set<String>): PairingQrScanResult {
+        if (raw == null) return PairingQrScanResult(errorCode = "QR_SCAN_CANCELLED")
+        val payload = decode(raw) ?: return PairingQrScanResult(errorCode = "QR_FORMAT_INVALID")
+        val issue = validate(payload, nowMillis, usedNonces)
+        return if (issue == null) PairingQrScanResult(payload = payload)
+        else PairingQrScanResult(errorCode = issue)
+    }
+
     /** Returns null only for a currently valid, unused bootstrap payload. */
     fun validate(payload: PairingQrPayload, nowMillis: Long, usedNonces: Set<String>): String? {
         if (payload.protocolVersion != PROTOCOL_VERSION) return "UNSUPPORTED_VERSION"
@@ -65,12 +81,6 @@ internal object PairingQr {
         if (payload.endpointData != BOOTSTRAP_SERVICE_ID) return "ENDPOINT_MISMATCH"
         if (payload.nonce in usedNonces) return "QR_REPLAYED"
         return null
-    }
-
-    fun consume(payload: PairingQrPayload, nowMillis: Long, usedNonces: MutableSet<String>): String? {
-        val issue = validate(payload, nowMillis, usedNonces)
-        if (issue == null) usedNonces += payload.nonce
-        return issue
     }
 
     private fun escape(value: String): String = buildString(value.length) {

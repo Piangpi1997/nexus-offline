@@ -3,11 +3,12 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APK="${1:-$ROOT_DIR/android/app/build/outputs/apk/debug/app-debug.apk}"
+SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Android/Sdk}}"
 ADB="${ADB:-$(command -v adb || true)}"
-if [[ -z "$ADB" && -x /home/ubuntu/Android/Sdk/platform-tools/adb ]]; then ADB=/home/ubuntu/Android/Sdk/platform-tools/adb; fi
+if [[ -z "$ADB" && -x "$SDK_ROOT/platform-tools/adb" ]]; then ADB="$SDK_ROOT/platform-tools/adb"; fi
 AAPT="${AAPT:-}"
 if [[ -z "$AAPT" ]]; then
-  for candidate in "${ANDROID_HOME:-}/build-tools/35.0.0/aapt" /home/ubuntu/Android/Sdk/build-tools/35.0.0/aapt; do
+  for candidate in "$SDK_ROOT/build-tools/35.0.0/aapt"; do
     [[ -x "$candidate" ]] && AAPT="$candidate" && break
   done
 fi

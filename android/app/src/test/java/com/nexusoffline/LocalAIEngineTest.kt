@@ -41,7 +41,7 @@ class LocalAIEngineTest {
 
     @Test fun modelMetadataCanBeInspectedWithoutStartingInference() {
         val root = File(temporaryFolder.root, "models")
-        val store = LocalAIModelStore(root) { Long.MAX_VALUE }
+        val store = newTestLocalAIStore(root) { Long.MAX_VALUE }
         val model = store.importModel("inspected.litertlm", ByteArrayInputStream(LiteRtLmContainerFixture.bytes()))
         val unavailable = UnavailableLocalAIEngine()
         assertTrue(model.inspection?.structurallyCompatible == true)
@@ -53,7 +53,7 @@ class LocalAIEngineTest {
 
     @Test fun nativeLoadFailureIsReportedForUnsupportedAbiWithoutClaimingInference() {
         val root = File(temporaryFolder.root, "models")
-        val store = LocalAIModelStore(root) { Long.MAX_VALUE }
+        val store = newTestLocalAIStore(root) { Long.MAX_VALUE }
         val model = store.importModel("structural-fixture.litertlm", ByteArrayInputStream(LiteRtLmContainerFixture.bytes()))
         val engine = LiteRtLocalAIEngine(
             modelStore = store,
@@ -71,7 +71,7 @@ class LocalAIEngineTest {
 
     @Test fun lowRamPreflightRejectsLoadBeforeNativeInitialization() {
         val root = File(temporaryFolder.root, "models")
-        val store = LocalAIModelStore(root) { Long.MAX_VALUE }
+        val store = newTestLocalAIStore(root) { Long.MAX_VALUE }
         val model = store.importModel("structural-fixture.litertlm", ByteArrayInputStream(LiteRtLmContainerFixture.bytes()))
         val engine = LiteRtLocalAIEngine(
             modelStore = store,
@@ -96,7 +96,7 @@ class LocalAIEngineTest {
     }
 
     @Test fun fakeRuntimeCancellationFencesLateCallbacksAndAllowsReloadedGeneration() {
-        val store = LocalAIModelStore(File(temporaryFolder.root, "models")) { Long.MAX_VALUE }
+        val store = newTestLocalAIStore(File(temporaryFolder.root, "models")) { Long.MAX_VALUE }
         val model = store.importModel("lifecycle.litertlm", ByteArrayInputStream(LiteRtLmContainerFixture.bytes()))
         val factory = FakeRuntimeFactory()
         val chunks = CopyOnWriteArrayList<String>()
@@ -104,6 +104,7 @@ class LocalAIEngineTest {
 
         assertEquals("MODEL_LOADING", engine.loadModel(model.id))
         awaitState(engine, "READY")
+        assertTrue(factory.latestModelPath()?.isFile == true)
         assertEquals("GENERATION_STARTED", engine.generate("first prompt"))
         awaitCondition("first generation callback") { factory.latestConversation()?.hasCallback == true }
         val cancelledConversation = factory.latestConversation()!!
@@ -112,6 +113,7 @@ class LocalAIEngineTest {
         assertTrue(engine.cancelGeneration())
         assertEquals("CANCELLED", engine.getRuntimeStatus().state)
         awaitCondition("cancelled runtime cleanup") { cancelledConversation.closed && factory.latestEngine()?.closed == true }
+        assertFalse(factory.latestModelPath()?.exists() == true)
         assertEquals("MODEL_NOT_LOADED", engine.generate("must reload first"))
         cancelledConversation.complete("stale output")
         assertEquals("CANCELLED", engine.getRuntimeStatus().state)
@@ -119,6 +121,7 @@ class LocalAIEngineTest {
 
         assertEquals("MODEL_LOADING", engine.loadModel(model.id))
         awaitState(engine, "READY")
+        assertTrue(factory.latestModelPath()?.isFile == true)
         assertEquals("GENERATION_STARTED", engine.generate("second prompt"))
         awaitCondition("reloaded generation callback") { factory.latestConversation()?.hasCallback == true }
         factory.latestConversation()!!.complete("fresh output")
@@ -127,11 +130,12 @@ class LocalAIEngineTest {
         assertTrue(engine.unloadModel())
         assertEquals("IDLE", engine.getRuntimeStatus().state)
         assertNull(engine.getRuntimeStatus().loadedModelId)
+        assertFalse(factory.latestModelPath()?.exists() == true)
         engine.close()
     }
 
     @Test fun loadedModelCannotBeDeletedAndAnotherModelCanBeImportedWithoutReplacingIt() {
-        val store = LocalAIModelStore(File(temporaryFolder.root, "models")) { Long.MAX_VALUE }
+        val store = newTestLocalAIStore(File(temporaryFolder.root, "models")) { Long.MAX_VALUE }
         val first = store.importModel("first.litertlm", ByteArrayInputStream(LiteRtLmContainerFixture.bytes()))
         val factory = FakeRuntimeFactory()
         val engine = newFakeRuntimeAdapter(store, factory)
@@ -151,16 +155,19 @@ class LocalAIEngineTest {
     }
 
     @Test fun adapterRecreationStartsUnloadedAndCanLoadPersistedModelAgain() {
-        val store = LocalAIModelStore(File(temporaryFolder.root, "models")) { Long.MAX_VALUE }
+        val store = newTestLocalAIStore(File(temporaryFolder.root, "models")) { Long.MAX_VALUE }
         val model = store.importModel("persisted.litertlm", ByteArrayInputStream(LiteRtLmContainerFixture.bytes()))
         val firstFactory = FakeRuntimeFactory()
         val firstAdapter = newFakeRuntimeAdapter(store, firstFactory)
         assertEquals("MODEL_LOADING", firstAdapter.loadModel(model.id))
         awaitState(firstAdapter, "READY")
+        val firstStage = firstFactory.latestModelPath()
+        assertTrue(firstStage?.isFile == true)
         firstAdapter.close()
         assertEquals("CLOSED", firstAdapter.getRuntimeStatus().state)
         assertNull(firstAdapter.getRuntimeStatus().loadedModelId)
         assertTrue(firstFactory.latestEngine()!!.closed)
+        assertFalse(firstStage?.exists() == true)
 
         val recreated = newFakeRuntimeAdapter(store, FakeRuntimeFactory())
         assertEquals("IDLE", recreated.getRuntimeStatus().state)
@@ -171,8 +178,38 @@ class LocalAIEngineTest {
         recreated.close()
     }
 
+    @Test fun failedRuntimeInitializationDeletesAuthenticatedPlaintextStage() {
+        val store = newTestLocalAIStore(File(temporaryFolder.root, "models")) { Long.MAX_VALUE }
+        val model = store.importModel("failed-load.litertlm", ByteArrayInputStream(LiteRtLmContainerFixture.bytes()))
+        val observedPath = java.util.concurrent.atomic.AtomicReference<File?>()
+        val failingFactory = object : LocalAIRuntimeFactory {
+            override fun create(modelPath: String, cacheDirectory: String): LocalAIRuntimeEngine {
+                observedPath.set(File(modelPath))
+                return object : LocalAIRuntimeEngine {
+                    override fun initialize() { throw IllegalStateException("NATIVE_INIT_FAILED") }
+                    override fun createConversation(): LocalAIRuntimeConversation = error("conversation must not be created")
+                    override fun close() = Unit
+                }
+            }
+        }
+        val engine = LiteRtLocalAIEngine(
+            modelStore = store,
+            cacheDirectory = File(temporaryFolder.root, "cache"),
+            deviceAbis = listOf("arm64-v8a"),
+            availableStorageBytes = { Long.MAX_VALUE },
+            availableRamBytes = { Long.MAX_VALUE },
+            totalRamBytes = { Long.MAX_VALUE },
+            runtimeFactory = failingFactory
+        ) { _, _ -> }
+        assertEquals("MODEL_LOADING", engine.loadModel(model.id))
+        awaitState(engine, "ERROR")
+        assertFalse(observedPath.get()?.exists() == true)
+        assertTrue(File(temporaryFolder.root, "models-plaintext-stage").listFiles().isNullOrEmpty())
+        engine.close()
+    }
+
     @Test fun unloadDuringGenerationFencesLateOutputAndClosesRuntimeOffThread() {
-        val store = LocalAIModelStore(File(temporaryFolder.root, "models")) { Long.MAX_VALUE }
+        val store = newTestLocalAIStore(File(temporaryFolder.root, "models")) { Long.MAX_VALUE }
         val model = store.importModel("unload-race.litertlm", ByteArrayInputStream(LiteRtLmContainerFixture.bytes()))
         val factory = FakeRuntimeFactory()
         val chunks = CopyOnWriteArrayList<String>()
@@ -193,8 +230,27 @@ class LocalAIEngineTest {
         engine.close()
     }
 
+    @Test fun memoryPressureReleaseClosesRuntimeBeforeRemovingPlaintextStageCache() {
+        val store = newTestLocalAIStore(File(temporaryFolder.root, "models")) { Long.MAX_VALUE }
+        val model = store.importModel("memory-pressure.litertlm", ByteArrayInputStream(LiteRtLmContainerFixture.bytes()))
+        val factory = FakeRuntimeFactory()
+        val engine = newFakeRuntimeAdapter(store, factory)
+        assertEquals("MODEL_LOADING", engine.loadModel(model.id))
+        awaitState(engine, "READY")
+        val stage = factory.latestModelPath()!!
+        assertTrue(stage.isFile)
+
+        engine.releaseForMemoryPressure()
+
+        assertTrue(factory.latestEngine()!!.closed)
+        assertFalse(stage.exists())
+        assertTrue(File(temporaryFolder.root, "models-plaintext-stage").listFiles().isNullOrEmpty())
+        assertEquals("IDLE", engine.getRuntimeStatus().state)
+        engine.close()
+    }
+
     @Test fun adapterCloseDuringGenerationFencesCallbacksForActivityTeardown() {
-        val store = LocalAIModelStore(File(temporaryFolder.root, "models")) { Long.MAX_VALUE }
+        val store = newTestLocalAIStore(File(temporaryFolder.root, "models")) { Long.MAX_VALUE }
         val model = store.importModel("close-race.litertlm", ByteArrayInputStream(LiteRtLmContainerFixture.bytes()))
         val factory = FakeRuntimeFactory()
         val chunks = CopyOnWriteArrayList<String>()
@@ -242,10 +298,12 @@ class LocalAIEngineTest {
 
 private class FakeRuntimeFactory : LocalAIRuntimeFactory {
     private val engines = CopyOnWriteArrayList<FakeRuntimeEngine>()
+    private val modelPaths = CopyOnWriteArrayList<File>()
     override fun create(modelPath: String, cacheDirectory: String): LocalAIRuntimeEngine =
-        FakeRuntimeEngine().also { engines += it }
+        FakeRuntimeEngine().also { engines += it; modelPaths += File(modelPath) }
     fun latestEngine(): FakeRuntimeEngine? = engines.lastOrNull()
     fun latestConversation(): FakeRuntimeConversation? = latestEngine()?.conversations?.lastOrNull()
+    fun latestModelPath(): File? = modelPaths.lastOrNull()
 }
 
 private class FakeRuntimeEngine : LocalAIRuntimeEngine {

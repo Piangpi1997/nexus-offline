@@ -14,25 +14,62 @@ dist/
 __pycache__/
 *.py[cod]
 *.log
-test-evidence/
+*.tmp
+*.temp
+*.swp
+*.swo
+*.bak
+*.orig
+*.rej
+.DS_Store
 
-# Binary deliverables and model weights (never commit)
+# Generated test artifacts and private device evidence
+test-evidence/
+private-device-logs/
+device-logs/
+logcat*.txt
+adb*.log
+/ui-validation/after/qr-modal/qr-modal-visual-regression.json
+
+# Build packages and generated native binaries (never commit)
 *.apk
 *.aab
+*.apks
+*.dex
+*.class
+*.so
+*.aar
+*.zip
+
+# Model weights and encrypted model containers
 *.litertlm
+*.nxm
 *.gguf
 *.tflite
 *.task
 *.bin
-*.zip
+*.onnx
+*.safetensors
+*.pt
+*.pth
+*.weights
+*.model
+*.pb
 
 # Signing material and local secrets
 .env
 .env.*
+secrets.*
+*.secret
+.secrets/
 *.jks
 *.keystore
 *.p12
 *.pfx
 *.pem
 *.key
-secrets.*
+*.asc
+*.csr
+key.properties
+keystore.properties
+signing.properties

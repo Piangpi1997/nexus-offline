@@ -78,6 +78,7 @@ internal class LiteRtLocalAIEngine(
     private val generationFence = LocalAIGenerationFence()
     private var engine: LocalAIRuntimeEngine? = null
     private var conversation: LocalAIRuntimeConversation? = null
+    private var stagedPlaintextModel: File? = null
     private var loadedModelId: String? = null
     private var state = "IDLE"
     private var lastError: String? = null
@@ -185,19 +186,20 @@ internal class LiteRtLocalAIEngine(
         executor.execute {
             var createdEngine: LocalAIRuntimeEngine? = null
             var createdConversation: LocalAIRuntimeConversation? = null
+            var stagedFile: File? = null
             try {
-                if (!model.file.isFile || model.file.length() != model.sizeBytes || model.file.length() <= 0L) {
-                    throw IllegalStateException("MODEL_FILE_INVALID")
-                }
+                if (!model.file.isFile || model.sizeBytes <= 0L) throw IllegalStateException("MODEL_FILE_INVALID")
                 if (deviceAbis.none { it in SUPPORTED_ABIS }) throw IllegalStateException("UNSUPPORTED_DEVICE_ABI_OR_RUNTIME")
                 cacheDirectory.mkdirs()
-                createdEngine = runtimeFactory.create(model.file.absolutePath, cacheDirectory.absolutePath)
+                stagedFile = modelStore.stageModelForRuntime(model.id)
+                createdEngine = runtimeFactory.create(stagedFile.absolutePath, cacheDirectory.absolutePath)
                 createdEngine.initialize()
                 createdConversation = createdEngine.createConversation()
                 val accepted = synchronized(lock) {
                     if (closed || !generationFence.isCurrent(epoch)) false else {
                         engine = createdEngine
                         conversation = createdConversation
+                        stagedPlaintextModel = stagedFile
                         loadedModelId = model.id
                         state = "READY"
                         lastError = null
@@ -208,6 +210,7 @@ internal class LiteRtLocalAIEngine(
                     runCatching { createdConversation.close() }
                     runCatching { createdEngine.close() }
                 }
+                if (accepted) stagedFile = null
             } catch (error: Throwable) {
                 runCatching { createdConversation?.close() }
                 runCatching { createdEngine?.close() }
@@ -226,6 +229,8 @@ internal class LiteRtLocalAIEngine(
                     } else false
                 }
                 if (shouldReport) emitState(code)
+            } finally {
+                stagedFile?.let(modelStore::cleanupRuntimeStage)
             }
         }
         return "MODEL_LOADING"
@@ -297,6 +302,7 @@ internal class LiteRtLocalAIEngine(
     override fun cancelGeneration(): Boolean {
         val oldConversation: LocalAIRuntimeConversation
         val oldEngine: LocalAIRuntimeEngine
+        val oldStage: File?
         synchronized(lock) {
             if (!generating || conversation == null || engine == null) return false
             generationFence.invalidate()
@@ -305,10 +311,12 @@ internal class LiteRtLocalAIEngine(
             loadedModelId = null
             oldConversation = conversation!!
             oldEngine = engine!!
+            oldStage = stagedPlaintextModel
             conversation = null
             engine = null
+            stagedPlaintextModel = null
         }
-        closeRuntimeAsync(oldConversation, oldEngine, "nexus-local-ai-cancel")
+        closeRuntimeAsync(oldConversation, oldEngine, oldStage, "nexus-local-ai-cancel")
         emitState("GENERATION_CANCELLED_MODEL_UNLOADED")
         return true
     }
@@ -316,6 +324,7 @@ internal class LiteRtLocalAIEngine(
     override fun unloadModel(): Boolean {
         val oldConversation: LocalAIRuntimeConversation?
         val oldEngine: LocalAIRuntimeEngine?
+        val oldStage: File?
         val closeAsynchronously: Boolean
         synchronized(lock) {
             val hadRuntime = engine != null || conversation != null || generating || state == "LOADING"
@@ -328,13 +337,42 @@ internal class LiteRtLocalAIEngine(
             lastError = null
             oldConversation = conversation
             oldEngine = engine
+            oldStage = stagedPlaintextModel
             conversation = null
             engine = null
+            stagedPlaintextModel = null
         }
-        if (closeAsynchronously) closeRuntimeAsync(oldConversation, oldEngine, "nexus-local-ai-unload")
-        else closeRuntime(oldConversation, oldEngine)
+        if (closeAsynchronously) closeRuntimeAsync(oldConversation, oldEngine, oldStage, "nexus-local-ai-unload")
+        else closeRuntime(oldConversation, oldEngine, oldStage)
         emitState("MODEL_UNLOADED")
         return true
+    }
+
+    override fun releaseForMemoryPressure() {
+        val oldConversation: LocalAIRuntimeConversation?
+        val oldEngine: LocalAIRuntimeEngine?
+        val oldStage: File?
+        val shouldEmit: Boolean
+        synchronized(lock) {
+            generationFence.invalidate()
+            generating = false
+            loadedModelId = null
+            shouldEmit = !closed
+            if (!closed) state = "IDLE"
+            lastError = null
+            oldConversation = conversation
+            oldEngine = engine
+            oldStage = stagedPlaintextModel
+            conversation = null
+            engine = null
+            stagedPlaintextModel = null
+        }
+        // This hook is called on a dedicated worker by the Activity. Close native resources first,
+        // then drain a concurrent load task before deleting any remaining private plaintext stage.
+        closeRuntime(oldConversation, oldEngine, oldStage)
+        runCatching { executor.submit { }.get() }
+        modelStore.cleanupPlaintextStageCache()
+        if (shouldEmit) emitState("MEMORY_PRESSURE_MODEL_RELEASED")
     }
 
     override fun deleteModel(modelId: String): String {
@@ -353,6 +391,7 @@ internal class LiteRtLocalAIEngine(
     override fun close() {
         val oldConversation: LocalAIRuntimeConversation?
         val oldEngine: LocalAIRuntimeEngine?
+        val oldStage: File?
         val closeAsynchronously: Boolean
         synchronized(lock) {
             if (closed) return
@@ -365,29 +404,34 @@ internal class LiteRtLocalAIEngine(
             lastError = null
             oldConversation = conversation
             oldEngine = engine
+            oldStage = stagedPlaintextModel
             conversation = null
             engine = null
+            stagedPlaintextModel = null
         }
         executor.shutdownNow()
-        if (closeAsynchronously) closeRuntimeAsync(oldConversation, oldEngine, "nexus-local-ai-close")
-        else closeRuntime(oldConversation, oldEngine)
+        if (closeAsynchronously) closeRuntimeAsync(oldConversation, oldEngine, oldStage, "nexus-local-ai-close")
+        else closeRuntime(oldConversation, oldEngine, oldStage)
     }
 
     private fun closeRuntimeLocked() {
         val oldConversation = conversation
         val oldEngine = engine
+        val oldStage = stagedPlaintextModel
         conversation = null
         engine = null
-        closeRuntime(oldConversation, oldEngine)
+        stagedPlaintextModel = null
+        closeRuntime(oldConversation, oldEngine, oldStage)
     }
 
-    private fun closeRuntimeAsync(conversation: LocalAIRuntimeConversation?, engine: LocalAIRuntimeEngine?, threadName: String) {
-        Thread({ closeRuntime(conversation, engine) }, threadName).apply { isDaemon = true }.start()
+    private fun closeRuntimeAsync(conversation: LocalAIRuntimeConversation?, engine: LocalAIRuntimeEngine?, stage: File?, threadName: String) {
+        Thread({ closeRuntime(conversation, engine, stage) }, threadName).apply { isDaemon = true }.start()
     }
 
-    private fun closeRuntime(conversation: LocalAIRuntimeConversation?, engine: LocalAIRuntimeEngine?) {
+    private fun closeRuntime(conversation: LocalAIRuntimeConversation?, engine: LocalAIRuntimeEngine?, stage: File? = null) {
         conversation?.let { runCatching { it.close() } }
         engine?.let { runCatching { it.close() } }
+        modelStore.cleanupRuntimeStage(stage)
     }
 
     private fun emitState(code: String) {

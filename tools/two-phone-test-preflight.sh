@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Android/Sdk}}"
 ADB="${ADB:-$(command -v adb || true)}"
-if [[ -z "$ADB" && -x /home/ubuntu/Android/Sdk/platform-tools/adb ]]; then ADB=/home/ubuntu/Android/Sdk/platform-tools/adb; fi
+if [[ -z "$ADB" && -x "$SDK_ROOT/platform-tools/adb" ]]; then ADB="$SDK_ROOT/platform-tools/adb"; fi
 PACKAGE_NAME="${PACKAGE_NAME:-com.nexusoffline.debug}"
 fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 [[ -n "$ADB" && -x "$ADB" ]] || fail 'adb is unavailable; add platform-tools to PATH or set ADB.'

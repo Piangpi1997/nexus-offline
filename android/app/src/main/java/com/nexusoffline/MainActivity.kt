@@ -95,6 +95,7 @@ class MainActivity : Activity() {
     @Volatile private var localAIImportInProgress = false
     @Volatile private var attachmentActionInProgress = false
     @Volatile private var clearInProgress = false
+    @Volatile private var pendingLocalAIModelMigrationResult: LegacyLocalAIModelMigrationResult? = null
     @Volatile private var pendingFileTarget: String? = null
     @Volatile private var permissionRequestInProgress = false
     @Volatile private var advertising = false
@@ -148,9 +149,12 @@ class MainActivity : Activity() {
         window.navigationBarColor = android.graphics.Color.rgb(16, 21, 34)
         secureStateStore = EncryptedStateStore(this)
         encryptedAttachmentStore = EncryptedAttachmentStore(this)
-        localAIModelStore = LocalAIModelStore(File(filesDir, "local-ai-models")) {
-            runCatching { StatFs(filesDir.absolutePath).availableBytes }.getOrDefault(0L)
-        }
+        localAIModelStore = LocalAIModelStore(
+            rootDirectory = File(filesDir, "local-ai-models"),
+            availableBytes = { runCatching { StatFs(filesDir.absolutePath).availableBytes }.getOrDefault(0L) },
+            keyProvider = AndroidLocalAIModelKeyProvider(),
+            plaintextStageDirectory = File(cacheDir, "local-ai-plaintext-stage")
+        )
         localAIModelStore.cleanupIncompleteImports()
         localAIEngine = LiteRtLocalAIEngine(
             modelStore = localAIModelStore,
@@ -178,6 +182,7 @@ class MainActivity : Activity() {
         }, "nexus-attachment-migration").start()
         connections = Nearby.getConnectionsClient(this)
         initializeWebView()
+        startLegacyLocalAIModelMigration()
     }
 
     @Deprecated("Framework activity-result callback is retained for the app's minimum SDK-compatible picker flow")
@@ -197,9 +202,11 @@ class MainActivity : Activity() {
         }
         val scan = IntentIntegrator.parseActivityResult(requestCode, resultCode, data)
         if (scan != null) {
-            val content = scan.contents
-            if (content == null) emit("qrPairing", JSONObject().put("ok", false).put("error", "QR_SCAN_CANCELLED"))
-            else processScannedPairingQr(content)
+            try {
+                processScannedPairingQr(scan.contents)
+            } catch (_: Exception) {
+                emit("qrPairing", JSONObject().put("ok", false).put("error", "QR_PROCESSING_FAILED"))
+            }
         }
     }
 
@@ -217,8 +224,7 @@ class MainActivity : Activity() {
         if (!::localAIEngine.isInitialized || !localAIMemoryTrimInProgress.compareAndSet(false, true)) return
         Thread({
             try {
-                val cancelled = runCatching { localAIEngine.cancelGeneration() }.getOrDefault(false)
-                if (!cancelled) runCatching { localAIEngine.unloadModel() }
+                runCatching { localAIEngine.releaseForMemoryPressure() }
             } finally {
                 localAIMemoryTrimInProgress.set(false)
             }
@@ -241,6 +247,7 @@ class MainActivity : Activity() {
                 if (view === webView) {
                     webPageReady = true
                     deliverPendingAttachmentMigrationWarning()
+                    deliverPendingLocalAIModelMigration()
                 }
             }
             override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): android.webkit.WebResourceResponse? {
@@ -322,7 +329,36 @@ class MainActivity : Activity() {
         emit("attachmentMigrationWarning", JSONObject().put("remaining", remaining))
     }
 
-    private fun showPairingQr(): String {
+    private fun startLegacyLocalAIModelMigration() {
+        if (!localAIModelStore.hasLegacyPlaintextModels()) return
+        localAIImportInProgress = true
+        Thread({
+            try {
+                val result = try {
+                    localAIModelStore.migrateLegacyPlaintextModels()
+                } catch (_: Exception) {
+                    LegacyLocalAIModelMigrationResult(0, if (localAIModelStore.hasLegacyPlaintextModels()) 1 else 0)
+                }
+                runCatching { localAIModelStore.cleanupIncompleteImports() }
+                pendingLocalAIModelMigrationResult = result
+            } finally {
+                localAIImportInProgress = false
+                runOnUiThread { if (!isFinishing) deliverPendingLocalAIModelMigration() }
+            }
+        }, "nexus-local-ai-model-migration").start()
+    }
+
+    private fun deliverPendingLocalAIModelMigration() {
+        if (!webPageReady) return
+        val result = pendingLocalAIModelMigrationResult ?: return
+        pendingLocalAIModelMigrationResult = null
+        if (result.migrated > 0) emit("localAIState", JSONObject().put("code", "MODEL_STORAGE_MIGRATED"))
+        if (result.remainingPlaintextFiles > 0) {
+            emit("localAIImportResult", JSONObject().put("ok", false).put("error", "MODEL_ENCRYPTION_MIGRATION_INCOMPLETE"))
+        }
+    }
+
+    private fun showPairingQr(language: String): String {
         return try {
             val payload = PairingQr.create(localEndpointName)
             val encoded = PairingQr.encode(payload)
@@ -331,19 +367,247 @@ class MainActivity : Activity() {
             for (x in 0 until matrix.width) for (y in 0 until matrix.height) {
                 bitmap.setPixel(x, y, if (matrix.get(x, y)) Color.BLACK else Color.WHITE)
             }
-            val image = ImageView(this).apply {
-                setImageBitmap(bitmap)
-                setPadding(18, 18, 18, 18)
-                adjustViewBounds = true
-            }
+            val english = language == "en"
             runOnUiThread {
-                if (!isFinishing) AlertDialog.Builder(this)
-                    .setTitle("NEXUS OFFLINE · ခဏတာ QR pairing")
-                    .setMessage("Public ID: ${payload.identityRef}\nသက်တမ်း ၂ မိနစ်သာရှိသည်။ Scan ပြီးလျှင် Nearby မှ အမည်တူစက်ကိုရွေးပြီး fingerprint ကို နှစ်ဖက်တိုက်စစ်ပါ။")
-                    .setView(image)
-                    .setPositiveButton("ပိတ်ရန်", null)
-                    .setOnDismissListener { bitmap.recycle() }
-                    .show()
+                if (isFinishing) {
+                    bitmap.recycle()
+                    return@runOnUiThread
+                }
+                val density = resources.displayMetrics.density
+                fun dp(value: Int) = (value * density + 0.5f).toInt()
+                val display = resources.displayMetrics
+                val primary = Color.parseColor("#F1F6F8")
+                val secondary = Color.parseColor("#A7B7C2")
+                val mint = Color.parseColor("#92F0CE")
+                val line = Color.parseColor("#354650")
+                val surface = Color.parseColor("#17232D")
+                val card = Color.parseColor("#101922")
+                val amber = Color.parseColor("#F3C47B")
+
+                fun rounded(fill: Int, stroke: Int = Color.TRANSPARENT, radiusDp: Int = 14) =
+                    android.graphics.drawable.GradientDrawable().apply {
+                        setColor(fill)
+                        cornerRadius = dp(radiusDp).toFloat()
+                        if (stroke != Color.TRANSPARENT) setStroke(dp(1), stroke)
+                    }
+                fun label(value: String, sizeSp: Float, color: Int, bold: Boolean = false) =
+                    android.widget.TextView(this).apply {
+                        text = value
+                        setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, sizeSp)
+                        setTextColor(color)
+                        if (bold) setTypeface(typeface, android.graphics.Typeface.BOLD)
+                        setLineSpacing(dp(2).toFloat(), 1f)
+                    }
+
+                val content = android.widget.LinearLayout(this).apply {
+                    orientation = android.widget.LinearLayout.VERTICAL
+                    setPadding(dp(16), dp(14), dp(16), dp(14))
+                    background = rounded(card, line, 20)
+                }
+                val titleRow = android.widget.LinearLayout(this).apply {
+                    gravity = android.view.Gravity.CENTER_VERTICAL
+                }
+                val title = label(if (english) "Connect with QR" else "QR ဖြင့် ချိတ်ဆက်ရန်", 18f, primary, true).apply {
+                    layoutParams = android.widget.LinearLayout.LayoutParams(0, android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                }
+                titleRow.addView(title)
+                content.addView(titleRow, android.widget.LinearLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+                ))
+
+                val publicIdRow = android.widget.LinearLayout(this).apply {
+                    orientation = android.widget.LinearLayout.HORIZONTAL
+                    gravity = android.view.Gravity.CENTER_VERTICAL
+                    setPadding(dp(12), dp(9), dp(12), dp(9))
+                    background = rounded(surface, line, 12)
+                }
+                val publicIdLabel = label("Public ID", 11f, secondary, true)
+                publicIdRow.addView(publicIdLabel)
+                val publicId = label(payload.identityRef, 15f, primary, true).apply {
+                    gravity = android.view.Gravity.END or android.view.Gravity.CENTER_VERTICAL
+                    setPadding(dp(8), 0, 0, 0)
+                    layoutParams = android.widget.LinearLayout.LayoutParams(0, android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                }
+                publicIdRow.addView(publicId)
+                content.addView(publicIdRow, android.widget.LinearLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(10) })
+
+                val instruction = label(
+                    if (english) "Scan the QR, then choose the matching Public ID in Nearby."
+                    else "QR ကို scan လုပ်ပြီး Nearby မှ တူညီသော Public ID ကို ရွေးပါ။",
+                    13f, primary
+                )
+                content.addView(instruction, android.widget.LinearLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(10) })
+
+                val qrSide = minOf(
+                    dp(236),
+                    display.widthPixels - dp(96),
+                    display.heightPixels - dp(350)
+                ).coerceAtLeast(dp(132))
+                val qrImage = android.widget.ImageView(this).apply {
+                    setImageBitmap(bitmap)
+                    scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
+                    adjustViewBounds = true
+                    setPadding(dp(8), dp(8), dp(8), dp(8))
+                    background = rounded(Color.WHITE, line, 12)
+                    contentDescription = if (english) {
+                        "Pairing QR code for Public ID ${payload.identityRef}. Keep the complete square code in view."
+                    } else {
+                        "Public ID ${payload.identityRef} အတွက် QR ကုဒ်။ QR ကို အပြည့်အစုံ မြင်နိုင်သည်။"
+                    }
+                    importantForAccessibility = android.view.View.IMPORTANT_FOR_ACCESSIBILITY_YES
+                }
+                content.addView(qrImage, android.widget.LinearLayout.LayoutParams(qrSide, qrSide).apply {
+                    gravity = android.view.Gravity.CENTER_HORIZONTAL
+                    topMargin = dp(12)
+                    bottomMargin = dp(10)
+                })
+
+                val securityHint = label(
+                    if (english) "Before connecting, compare the fingerprint on both devices."
+                    else "ချိတ်ဆက်မီ စက်နှစ်လုံး၏ fingerprint ကို တိုက်စစ်ပါ။",
+                    12f, secondary
+                ).apply {
+                    setPadding(dp(10), dp(8), dp(10), dp(8))
+                    background = rounded(surface, line, 10)
+                }
+                content.addView(securityHint, android.widget.LinearLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+                ))
+
+                val timer = label("", 12f, mint, true).apply {
+                    gravity = android.view.Gravity.CENTER
+                    contentDescription = if (english) "QR expiry countdown" else "QR ကုဒ် သက်တမ်းကျန်ချိန်ကို ပြသသော အညွှန်း"
+                }
+                content.addView(timer, android.widget.LinearLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(6) })
+                val expiredState = label(
+                    if (english) "QR expired. This is not an error. Create a new QR and scan again."
+                    else "QR ကုဒ် သက်တမ်းကုန်သွားပါပြီ။ အမှားမဟုတ်ပါ။ QR အသစ်ဖန်တီးပြီး ထပ်မံ scan လုပ်ပါ။",
+                    12f, amber, true
+                ).apply {
+                    visibility = android.view.View.GONE
+                    accessibilityLiveRegion = android.view.View.ACCESSIBILITY_LIVE_REGION_POLITE
+                }
+                content.addView(expiredState, android.widget.LinearLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(4) })
+
+                val actions = android.widget.LinearLayout(this).apply {
+                    orientation = android.widget.LinearLayout.HORIZONTAL
+                    gravity = android.view.Gravity.CENTER_VERTICAL
+                }
+                fun actionButton(text: String, description: String, fill: Int, color: Int) =
+                    android.widget.Button(this).apply {
+                        this.text = text
+                        contentDescription = description
+                        isAllCaps = false
+                        setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 14f)
+                        setTextColor(color)
+                        minHeight = dp(48)
+                        minWidth = dp(48)
+                        setPadding(dp(8), dp(8), dp(8), dp(8))
+                        background = rounded(fill, line, 12)
+                    }
+                val newQr = actionButton(
+                    if (english) "New QR" else "QR အသစ်",
+                    if (english) "Create a new pairing QR code" else "QR အသစ်ဖန်တီးရန်",
+                    Color.parseColor("#18372F"), mint
+                )
+                val close = actionButton(
+                    if (english) "Close" else "ပိတ်ရန်",
+                    if (english) "Close QR dialog" else "QR modal ကို ပိတ်ရန်",
+                    surface, primary
+                )
+                actions.addView(newQr, android.widget.LinearLayout.LayoutParams(0, android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                actions.addView(android.view.View(this), android.widget.LinearLayout.LayoutParams(dp(8), 1))
+                actions.addView(close, android.widget.LinearLayout.LayoutParams(0, android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                content.addView(actions, android.widget.LinearLayout.LayoutParams(
+                    android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                    android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(10) })
+
+                val maxDialogHeight = (display.heightPixels - dp(72)).coerceAtLeast(dp(180))
+                val scroll = object : android.widget.ScrollView(this) {
+                    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+                        val constrainedHeight = android.view.View.MeasureSpec.makeMeasureSpec(
+                            maxDialogHeight, android.view.View.MeasureSpec.AT_MOST
+                        )
+                        super.onMeasure(widthMeasureSpec, constrainedHeight)
+                    }
+                }.apply {
+                    isFillViewport = true
+                    clipToPadding = false
+                    overScrollMode = android.view.View.OVER_SCROLL_IF_CONTENT_SCROLLS
+                    addView(content, android.widget.FrameLayout.LayoutParams(
+                        android.view.ViewGroup.LayoutParams.MATCH_PARENT,
+                        android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+                    ))
+                }
+                val dialog = AlertDialog.Builder(this).setView(scroll).create()
+                dialog.setCancelable(true)
+                dialog.setCanceledOnTouchOutside(true)
+                close.setOnClickListener { dialog.dismiss() }
+                newQr.setOnClickListener {
+                    dialog.dismiss()
+                    showPairingQr(if (english) "en" else "my")
+                }
+                dialog.setOnKeyListener { _, keyCode, event ->
+                    if (keyCode == android.view.KeyEvent.KEYCODE_ESCAPE) {
+                        if (event.action == android.view.KeyEvent.ACTION_UP) dialog.dismiss()
+                        true
+                    } else false
+                }
+                val expiryTicker = object : Runnable {
+                    override fun run() {
+                        if (!dialog.isShowing) return
+                        val remaining = (payload.expiresAtMillis - System.currentTimeMillis()).coerceAtLeast(0L)
+                        val seconds = (remaining + 999L) / 1000L
+                        timer.text = if (remaining == 0L) {
+                            if (english) "Expired" else "သက်တမ်းကုန်သွားပါပြီ"
+                        } else {
+                            val formatted = String.format(java.util.Locale.ROOT, "%02d:%02d", seconds / 60L, seconds % 60L)
+                            if (english) "Expires in $formatted" else "$formatted အတွင်း သက်တမ်းကုန်မည်"
+                        }
+                        if (remaining == 0L) expiredState.visibility = android.view.View.VISIBLE
+                        mainHandler.postDelayed(this, 1000L)
+                    }
+                }
+                dialog.setOnDismissListener {
+                    mainHandler.removeCallbacks(expiryTicker)
+                    if (!bitmap.isRecycled) bitmap.recycle()
+                    if (::webView.isInitialized && !isFinishing) {
+                        webView.post {
+                            webView.requestFocus(android.view.View.FOCUS_DOWN)
+                            webView.evaluateJavascript(
+                                "document.getElementById('pair-qr')?.focus({preventScroll:true})", null
+                            )
+                        }
+                    }
+                }
+                dialog.show()
+                dialog.window?.apply {
+                    setBackgroundDrawable(android.graphics.drawable.ColorDrawable(Color.TRANSPARENT))
+                    addFlags(android.view.WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+                    setDimAmount(0.70f)
+                    setLayout((display.widthPixels - dp(32)).coerceAtLeast(dp(240)).coerceAtMost(dp(440)), android.view.WindowManager.LayoutParams.WRAP_CONTENT)
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    dialog.window?.decorView?.accessibilityPaneTitle = title.text
+                    title.setAccessibilityHeading(true)
+                }
+                close.requestFocus()
+                expiryTicker.run()
             }
             JSONObject().put("ok", true).put("expiresAt", payload.expiresAtMillis).toString()
         } catch (_: Exception) {
@@ -376,14 +640,14 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun processScannedPairingQr(raw: String) {
-        val payload = PairingQr.decode(raw)
-        if (payload == null) {
-            emit("qrPairing", JSONObject().put("ok", false).put("error", "QR_FORMAT_INVALID"))
+    private fun processScannedPairingQr(raw: String?) {
+        val now = System.currentTimeMillis()
+        if (raw == null) {
+            val cancelled = PairingQr.scan(null, now, emptySet())
+            emit("qrPairing", JSONObject().put("ok", false).put("error", cancelled.errorCode))
             return
         }
         val prefs = getSharedPreferences("nexus", MODE_PRIVATE)
-        val now = System.currentTimeMillis()
         val storedEntries = prefs.getStringSet(QR_USED_NONCES_KEY, emptySet()).orEmpty()
         val retained = linkedMapOf<String, Long>()
         storedEntries.forEach { entry ->
@@ -391,9 +655,10 @@ class MainActivity : Activity() {
             val expiry = split.getOrNull(1)?.toLongOrNull()
             if (split.size == 2 && expiry != null && expiry > now) retained[split[0]] = expiry
         }
-        val issue = PairingQr.consume(payload, now, retained.keys)
-        if (issue != null) {
-            emit("qrPairing", JSONObject().put("ok", false).put("error", issue))
+        val scan = PairingQr.scan(raw, now, retained.keys)
+        val payload = scan.payload
+        if (payload == null) {
+            emit("qrPairing", JSONObject().put("ok", false).put("error", scan.errorCode ?: "QR_PROCESSING_FAILED"))
             return
         }
         retained[payload.nonce] = payload.expiresAtMillis + PairingQr.TTL_MILLIS
@@ -1200,7 +1465,7 @@ class MainActivity : Activity() {
             try {
                 val result = secureStateStore.clear()
                 if (result.optBoolean("ok")) {
-                    localAIEngine.unloadModel()
+                    localAIEngine.releaseForMemoryPressure()
                     val modelsCleared = localAIModelStore.clear()
                     File(cacheDir, "litertlm-cache").deleteRecursively()
                     val attachmentsCleared = encryptedAttachmentStore.clear()
@@ -1239,7 +1504,7 @@ class MainActivity : Activity() {
         @JavascriptInterface fun useAttachment(transferId: String, action: String): String = beginAttachmentAction(transferId, action)
         @JavascriptInterface fun deleteAttachment(transferId: String): String = beginAttachmentDelete(transferId)
 
-        @JavascriptInterface fun createPairingQr(): String = showPairingQr()
+        @JavascriptInterface fun createPairingQr(language: String): String = showPairingQr(if (language == "en") "en" else "my")
         @JavascriptInterface fun scanPairingQr(): String = requestPairingQrScan()
 
         @JavascriptInterface fun getLocalAIStatus(): String = localAIStatusJson().toString()

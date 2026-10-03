@@ -10,6 +10,7 @@ from playwright.sync_api import sync_playwright
 
 URL = os.environ.get("NEXUS_TEST_URL", "http://127.0.0.1:4174/")
 PAGES = ("home", "chats", "ai", "nearby", "diagnostics", "settings")
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def assert_page(page, name):
@@ -137,7 +138,7 @@ with sync_playwright() as p:
     mobile.locator(".brand[data-page='home']").tap()
     assert_page(mobile, "home")
     mobile.wait_for_timeout(350)
-    evidence = Path(__file__).resolve().parents[1] / "ui-validation" / "after"
+    evidence = ROOT / "ui-validation" / "after"
     evidence.mkdir(parents=True, exist_ok=True)
     mobile.screenshot(path=str(evidence / "mobile-home-nav-393.png"), full_page=True)
 

@@ -26,9 +26,24 @@ class PairingQrTest {
         val now = 1_800_000_000_000L
         val payload = PairingQr.create("NX-public_ref-1234", now)
         assertEquals("QR_EXPIRED", PairingQr.validate(payload, payload.expiresAtMillis, emptySet()))
-        val used = mutableSetOf<String>()
-        assertNull(PairingQr.consume(payload, now, used))
-        assertEquals("QR_REPLAYED", PairingQr.consume(payload, now, used))
+        assertEquals("QR_EXPIRED", PairingQr.scan(PairingQr.encode(payload), payload.expiresAtMillis, emptySet()).errorCode)
+        assertEquals("QR_REPLAYED", PairingQr.scan(PairingQr.encode(payload), now, setOf(payload.nonce)).errorCode)
+    }
+
+    @Test fun scannerResultHandlerSafelyHandlesSuccessCancellationMalformedAndExpiredResults() {
+        val now = 1_800_000_000_000L
+        val payload = PairingQr.create("NX-public_ref-1234", now)
+        val existingNonceMap = linkedMapOf("already-used-nonce" to now + PairingQr.TTL_MILLIS)
+
+        val accepted = PairingQr.scan(PairingQr.encode(payload), now, existingNonceMap.keys)
+        assertTrue(accepted.ok)
+        assertEquals(payload, accepted.payload)
+        assertNull(accepted.errorCode)
+        assertEquals(setOf("already-used-nonce"), existingNonceMap.keys)
+
+        assertEquals("QR_SCAN_CANCELLED", PairingQr.scan(null, now, emptySet()).errorCode)
+        assertEquals("QR_FORMAT_INVALID", PairingQr.scan("not-a-pairing-qr", now, emptySet()).errorCode)
+        assertEquals("QR_EXPIRED", PairingQr.scan(PairingQr.encode(payload), payload.expiresAtMillis, emptySet()).errorCode)
     }
 
     @Test fun malformedOrLongLivedPayloadsAreRejected() {

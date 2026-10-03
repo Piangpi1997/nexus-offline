@@ -29,6 +29,19 @@ def metrics(page):
       const targets = [...document.querySelectorAll('button,a,[role=button]')].filter(visible);
       const text = [...document.querySelectorAll('h1,h2,h3,p,small,.native-state strong,.native-state small,.attachment-description')]
         .filter(visible).filter(e => !['nowrap','pre'].includes(getComputedStyle(e).whiteSpace));
+      const rect = e => e.getBoundingClientRect();
+      const intersects = (a,b) => Math.min(a.right,b.right)-Math.max(a.left,b.left) > 1 && Math.min(a.bottom,b.bottom)-Math.max(a.top,b.top) > 1;
+      const inViewport = e => { const r=rect(e); return r.right > 0 && r.left < innerWidth; };
+      const activeTargets = targets.filter(e => (e.closest('.page.active') || e.closest('.topbar')) && inViewport(e));
+      const targetOverlaps = [];
+      for (let i=0;i<activeTargets.length;i++) for (let j=i+1;j<activeTargets.length;j++) {
+        if (intersects(rect(activeTargets[i]),rect(activeTargets[j]))) targetOverlaps.push([activeTargets[i].id||activeTargets[i].innerText,activeTargets[j].id||activeTargets[j].innerText]);
+      }
+      const textTargetOverlaps = [];
+      for (const t of text.filter(e => e.closest('.page.active') || e.closest('.topbar'))) for (const c of activeTargets) {
+        if (c.contains(t) || t.contains(c)) continue;
+        if (intersects(rect(t),rect(c))) textTargetOverlaps.push([(t.innerText||'').trim().slice(0,48),c.id||c.innerText||c.getAttribute('aria-label')]);
+      }
       return {
         width: innerWidth,
         scrollWidth: document.documentElement.scrollWidth,
@@ -38,6 +51,8 @@ def metrics(page):
           .filter(x => x.scroll > x.w + 2),
         malformedUnicode: document.body.innerText.includes(String.fromCharCode(0xfffd)),
         hasBurmese: /[\u1000-\u109f]/.test(document.body.innerText),
+        targetOverlaps,
+        textTargetOverlaps,
         hiddenViolations: [...document.querySelectorAll('[hidden]')]
           .filter(e => getComputedStyle(e).display !== 'none' || e.getClientRects().length)
           .map(e => e.id || e.className || e.tagName)
@@ -50,8 +65,39 @@ def assert_layout(page, label):
     assert m["scrollWidth"] <= m["width"], f"horizontal overflow {label}: {m}"
     assert not m["shortTargets"], f"under-44px visible control {label}: {m['shortTargets']}"
     assert not m["textOverflow"], f"text does not wrap {label}: {m['textOverflow']}"
+    assert not m["targetOverlaps"], f"visible controls overlap {label}: {m['targetOverlaps']}"
+    assert not m["textTargetOverlaps"], f"text overlaps a visible control {label}: {m['textTargetOverlaps']}"
     assert not m["hiddenViolations"], f"hidden element became visible {label}: {m['hiddenViolations']}"
     assert m["hasBurmese"] and not m["malformedUnicode"], f"Myanmar text malformed/missing {label}"
+
+
+def assert_low_box_hierarchy(page, name, width):
+    if name == "home":
+        rows = page.evaluate("""() => [...document.querySelectorAll('#page-home .status-card')].map(e => {
+          const s=getComputedStyle(e), r=e.getBoundingClientRect();
+          return {height:r.height, border:s.borderTopWidth, title:e.querySelector('h3')?.textContent.trim()};
+        })""")
+        assert len(rows) == 3, f"Home must retain all three status rows: {rows}"
+        assert all(float(row["height"]) <= 112 for row in rows), f"Home status rows are not compact at {width}px: {rows}"
+        assert all(row["border"] == "0px" for row in rows), f"Home status cards gained unnecessary outlines at {width}px: {rows}"
+    if name == "ai":
+        ai = page.evaluate("""() => ({
+          nestedPanels:document.querySelectorAll('#page-ai .panel .panel').length,
+          status:[...document.querySelectorAll('#page-ai .ai-status-card')].map(e=>({top:getComputedStyle(e).borderTopWidth,left:getComputedStyle(e).borderLeftWidth,right:getComputedStyle(e).borderRightWidth,radius:getComputedStyle(e).borderRadius})),
+          model:{border:getComputedStyle(document.querySelector('#page-ai .ai-model-information')).borderTopWidth,radius:getComputedStyle(document.querySelector('#page-ai .ai-model-information')).borderRadius}
+        })""")
+        assert ai["nestedPanels"] == 0, f"Local AI contains nested main panels at {width}px: {ai}"
+        assert all(x["left"] == "0px" and x["right"] == "0px" and x["radius"] == "0px" for x in ai["status"]), f"Local AI status rows look like nested cards at {width}px: {ai}"
+        assert ai["model"] == {"border": "0px", "radius": "0px"}, f"Local AI model details retain a nested card outline at {width}px: {ai}"
+    if name == "nearby":
+        nearby = page.evaluate("""() => ({
+          nestedPanels:document.querySelectorAll('#page-nearby .panel .panel').length,
+          attachmentPanel:{border:getComputedStyle(document.querySelector('#page-nearby #attachment-panel')).borderTopWidth,radius:getComputedStyle(document.querySelector('#page-nearby #attachment-panel')).borderRadius},
+          pairing:[...document.querySelectorAll('#page-nearby .pairing-step')].map(e=>({radius:getComputedStyle(e).borderRadius,background:getComputedStyle(e).backgroundColor}))
+        })""")
+        assert nearby["nestedPanels"] == 0, f"Nearby contains nested main panels at {width}px: {nearby}"
+        assert nearby["attachmentPanel"]["radius"] == "14px", f"Nearby attachment section should retain one modest main container at {width}px: {nearby}"
+        assert all(x["radius"] == "0px" for x in nearby["pairing"]), f"Pairing steps should use dividers, not nested rounded cards, at {width}px: {nearby}"
 
 
 def open_route(page, name):
@@ -86,10 +132,12 @@ with sync_playwright() as p:
         page.wait_for_timeout(3300)  # Let the startup toast clear before saving evidence.
         page.screenshot(path=str(OUT / f"home-{width}.png"), full_page=True)
         assert_layout(page, f"home at {width}px")
+        assert_low_box_hierarchy(page, "home", width)
 
         for name in PAGES[1:]:
             open_route(page, name)
             assert_layout(page, f"{name} at {width}px")
+            assert_low_box_hierarchy(page, name, width)
             if name == "nearby":
                 # Exercise mixed Burmese/English technical strings at the narrow width.
                 page.locator(".nearby-copy > p").evaluate("e => e.textContent = 'ဖိုင်လုံခြုံရေး · AES-GCM · SHA-256 · Nearby · Local AI · QR · physical-device/10-phone verification. ' + 'ဒီစက်တွင် စစ်ဆေးရန်လိုသည့် အခြေအနေများကို ဆက်လက်ဖော်ပြထားသည်။'")

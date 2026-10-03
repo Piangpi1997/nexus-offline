@@ -17,7 +17,7 @@ class LocalAIModelStoreTest {
 
     @Test fun importsValidatedModelPrivatelyWithStableHashAndNoOriginalPath() {
         val root = File(temporaryFolder.root, "models")
-        val store = LocalAIModelStore(root) { Long.MAX_VALUE }
+        val store = newTestLocalAIStore(root) { Long.MAX_VALUE }
         val modelBytes = LiteRtLmContainerFixture.bytes()
         val imported = store.importModel("/untrusted/path/Gemma3-1B.litertlm", ByteArrayInputStream(modelBytes))
         assertEquals(64, imported.id.length)
@@ -33,7 +33,7 @@ class LocalAIModelStoreTest {
 
     @Test fun rejectsUnsupportedFormatAndInsufficientSpace() {
         val root = File(temporaryFolder.root, "models")
-        val noSpaceStore = LocalAIModelStore(root) { 0L }
+        val noSpaceStore = newTestLocalAIStore(root) { 0L }
         assertEquals("UNSUPPORTED_MODEL_FORMAT", assertThrows(IllegalArgumentException::class.java) {
             noSpaceStore.importModel("model.bin", ByteArrayInputStream(byteArrayOf(1)))
         }.message)
@@ -41,14 +41,14 @@ class LocalAIModelStoreTest {
             noSpaceStore.importModel("model.litertlm", ByteArrayInputStream(LiteRtLmContainerFixture.bytes()))
         }.message)
         assertThrows(IllegalArgumentException::class.java) {
-            LocalAIModelStore(root) { Long.MAX_VALUE }.importModel("../model\n.litertlm", ByteArrayInputStream(byteArrayOf(1)))
+            newTestLocalAIStore(root) { Long.MAX_VALUE }.importModel("../model\n.litertlm", ByteArrayInputStream(byteArrayOf(1)))
         }
         assertTrue(root.listFiles().orEmpty().isEmpty())
     }
 
     @Test fun rejectsArbitraryFileWithLitertlmExtensionWithoutKeepingPartialFile() {
         val root = File(temporaryFolder.root, "models")
-        val store = LocalAIModelStore(root) { Long.MAX_VALUE }
+        val store = newTestLocalAIStore(root) { Long.MAX_VALUE }
         assertEquals("UNSUPPORTED_MODEL_FORMAT", assertThrows(IllegalArgumentException::class.java) {
             store.importModel("fake.litertlm", ByteArrayInputStream(ByteArray(512)))
         }.message)
@@ -57,7 +57,7 @@ class LocalAIModelStoreTest {
 
     @Test fun rejectsEmptyTruncatedOversizedAndSizeMismatchedImportsWithoutLeavingParts() {
         val root = File(temporaryFolder.root, "models")
-        val store = LocalAIModelStore(root) { Long.MAX_VALUE }
+        val store = newTestLocalAIStore(root) { Long.MAX_VALUE }
         assertEquals("EMPTY_MODEL", assertThrows(IllegalArgumentException::class.java) {
             store.importModel("empty.litertlm", ByteArrayInputStream(byteArrayOf()))
         }.message)
@@ -76,7 +76,7 @@ class LocalAIModelStoreTest {
 
     @Test fun failedCopyRemovesPartialWeightFile() {
         val root = File(temporaryFolder.root, "models")
-        val store = LocalAIModelStore(root) { Long.MAX_VALUE }
+        val store = newTestLocalAIStore(root) { Long.MAX_VALUE }
         val broken = object : InputStream() {
             private var sent = false
             override fun read(): Int {
@@ -90,7 +90,7 @@ class LocalAIModelStoreTest {
 
     @Test fun fatalSourceFailureStillRemovesPartialImportFile() {
         val root = File(temporaryFolder.root, "models")
-        val store = LocalAIModelStore(root) { Long.MAX_VALUE }
+        val store = newTestLocalAIStore(root) { Long.MAX_VALUE }
         val failing = object : InputStream() {
             private var sent = false
             override fun read(): Int {
@@ -102,21 +102,22 @@ class LocalAIModelStoreTest {
         assertTrue(root.listFiles().orEmpty().isEmpty())
     }
 
-    @Test fun startupCleanupRemovesOnlyIncompleteImportParts() {
+    @Test fun startupCleanupRemovesInterruptedEncryptedImportsAndStalePlaintextStage() {
         val root = File(temporaryFolder.root, "models").apply { mkdirs() }
-        val partial = File(root, "import-01234567-89ab-cdef-0123-456789abcdef.part").apply { writeText("partial") }
-        val orphanName = File(root, "${"a".repeat(64)}.name").apply { writeText("orphan.litertlm") }
+        val partial = File(root, "import-${"a".repeat(32)}.nxm.part").apply { writeText("partial") }
+        val staging = File(root.parentFile, "${root.name}-plaintext-stage").apply { mkdirs() }
+        val stalePlaintext = File(staging, "${"b".repeat(64)}-stale.litertlm").apply { writeText("plain") }
         val unrelated = File(root, "keep.txt").apply { writeText("keep") }
-        val store = LocalAIModelStore(root) { Long.MAX_VALUE }
+        val store = newTestLocalAIStore(root)
         assertEquals(2, store.cleanupIncompleteImports())
         assertFalse(partial.exists())
-        assertFalse(orphanName.exists())
+        assertFalse(stalePlaintext.exists())
         assertTrue(unrelated.isFile)
     }
 
     @Test fun cancelledSafPickerDoesNotCreateModelFiles() {
         val root = File(temporaryFolder.root, "models")
-        val store = LocalAIModelStore(root) { Long.MAX_VALUE }
+        val store = newTestLocalAIStore(root) { Long.MAX_VALUE }
         assertNull(store.importPickedModel(null, null))
         assertFalse(root.exists())
         assertNull(store.importPickedModel("model.litertlm", null))
@@ -125,7 +126,7 @@ class LocalAIModelStoreTest {
 
     @Test fun pickedStreamClosesWhenPreflightRejectsTheFilename() {
         val root = File(temporaryFolder.root, "models")
-        val store = LocalAIModelStore(root) { Long.MAX_VALUE }
+        val store = newTestLocalAIStore(root) { Long.MAX_VALUE }
         var closed = false
         val source = object : ByteArrayInputStream(byteArrayOf(1, 2, 3)) {
             override fun close() {
@@ -142,9 +143,9 @@ class LocalAIModelStoreTest {
 
     @Test fun modelStatePersistsAcrossStoreInstancesAndCanBeDeleted() {
         val root = File(temporaryFolder.root, "models")
-        val firstStore = LocalAIModelStore(root) { Long.MAX_VALUE }
+        val firstStore = newTestLocalAIStore(root) { Long.MAX_VALUE }
         val imported = firstStore.importModel("local-test.litertlm", ByteArrayInputStream(LiteRtLmContainerFixture.bytes()))
-        val restartedStore = LocalAIModelStore(root) { Long.MAX_VALUE }
+        val restartedStore = newTestLocalAIStore(root) { Long.MAX_VALUE }
         assertEquals(imported.id, restartedStore.listModels().single().id)
         assertEquals("local-test.litertlm", restartedStore.findModel(imported.id)?.displayName)
         assertTrue(restartedStore.deleteModel(imported.id))
@@ -152,20 +153,58 @@ class LocalAIModelStoreTest {
         assertFalse(restartedStore.deleteModel("../../unsafe"))
     }
 
-    @Test fun corruptedDisplayMetadataFallsBackToSafeNonAuthoritativeLabel() {
+    @Test fun legacyPlaintextModelMigratesOnlyAfterEncryptedCommit() {
+        val root = File(temporaryFolder.root, "models").apply { mkdirs() }
+        val bytes = LiteRtLmContainerFixture.bytes()
+        val id = java.security.MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+        val legacy = File(root, "$id.litertlm").apply { writeBytes(bytes) }
+        val oldLabel = File(root, "$id.name").apply { writeText("legacy-name.litertlm") }
+        val store = newTestLocalAIStore(root) { Long.MAX_VALUE }
+
+        assertTrue(store.hasLegacyPlaintextModels())
+        val result = store.migrateLegacyPlaintextModels()
+
+        assertEquals(1, result.migrated)
+        assertEquals(0, result.remainingPlaintextFiles)
+        assertFalse(legacy.exists())
+        assertFalse(oldLabel.exists())
+        assertTrue(File(root, "$id.nxm").isFile)
+        assertEquals("legacy-name.litertlm", store.findModel(id)?.displayName)
+    }
+
+    @Test fun invalidLegacyFilenameHashIsPreservedAndNeverImported() {
+        val root = File(temporaryFolder.root, "models").apply { mkdirs() }
+        val legacy = File(root, "${"a".repeat(64)}.litertlm").apply { writeBytes(LiteRtLmContainerFixture.bytes()) }
+        val store = newTestLocalAIStore(root) { Long.MAX_VALUE }
+
+        val result = store.migrateLegacyPlaintextModels()
+
+        assertEquals(0, result.migrated)
+        assertEquals(1, result.remainingPlaintextFiles)
+        assertTrue(legacy.isFile)
+        assertTrue(store.listModels().isEmpty())
+    }
+
+    @Test fun corruptedEncryptedMetadataFallsBackToSafeNonAuthoritativeLabel() {
         val root = File(temporaryFolder.root, "models")
-        val store = LocalAIModelStore(root) { Long.MAX_VALUE }
+        val store = newTestLocalAIStore(root) { Long.MAX_VALUE }
         val imported = store.importModel("safe-name.litertlm", ByteArrayInputStream(LiteRtLmContainerFixture.bytes()))
-        File(root, "${imported.id}.name").writeText("../outside.litertlm")
+        java.io.RandomAccessFile(imported.file, "rw").use { file ->
+            file.seek(file.length() - 9L)
+            val original = file.readByte()
+            file.seek(file.length() - 9L)
+            file.writeByte(original.toInt() xor 0x01)
+        }
         val listed = store.findModel(imported.id)!!
         assertEquals("Imported model ${imported.id.take(12)}", listed.displayName)
         assertEquals(root.canonicalFile, listed.file.canonicalFile.parentFile)
         assertTrue(listed.file.isFile)
+        assertEquals("MODEL_METADATA_AUTHENTICATION_FAILED", listed.inspectionError)
     }
 
     @Test fun unknownArchitectureImportRemainsRuntimeLoadRequired() {
         val root = File(temporaryFolder.root, "models")
-        val store = LocalAIModelStore(root) { Long.MAX_VALUE }
+        val store = newTestLocalAIStore(root) { Long.MAX_VALUE }
         val imported = store.importModel(
             "unknown-architecture.litertlm",
             ByteArrayInputStream(LiteRtLmContainerFixture.bytes(architecture = "future_decoder_v9"))
