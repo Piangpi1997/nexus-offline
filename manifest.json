@@ -1,0 +1,14 @@
+{
+  "name": "NEXUS OFFLINE",
+  "short_name": "NEXUS",
+  "description": "Private AI. Nearby Chat. No Internet Required.",
+  "lang": "my",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0a1017",
+  "theme_color": "#0a1017",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

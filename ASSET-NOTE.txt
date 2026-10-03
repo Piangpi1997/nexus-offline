@@ -1,0 +1,1 @@
+The local hero visual is bundled at assets/nexus-circuit.jpg (downloaded from an image-search result so it remains available offline). No remote image dependency is used at runtime.

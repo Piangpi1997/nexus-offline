@@ -1,0 +1,38 @@
+# Android/Gradle generated output and local machine state
+.gradle/
+.kotlin/
+**/build/
+local.properties
+**/local.properties
+.idea/
+*.iml
+
+# Web/tool build output and runtime evidence
+node_modules/
+dist/
+.wrangler/
+__pycache__/
+*.py[cod]
+*.log
+test-evidence/
+
+# Binary deliverables and model weights (never commit)
+*.apk
+*.aab
+*.litertlm
+*.gguf
+*.tflite
+*.task
+*.bin
+*.zip
+
+# Signing material and local secrets
+.env
+.env.*
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+secrets.*
