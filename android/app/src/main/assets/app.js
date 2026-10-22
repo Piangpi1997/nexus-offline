@@ -427,6 +427,21 @@
     }
     if(event.type==='fileTransferError') { failFileTransfer(event.transferId,event.code||'FILE_TRANSFER_FAILED',event.endpointId); return; }
     if(event.type==='filePickCancelled') { toast('ဖိုင်ရွေးချယ်မှုကို ပယ်ဖျက်လိုက်သည်'); return; }
+    if(event.type==='transportError'||event.type==='radioDisabled') {
+      const code=safe(event.code||event.source||'RADIO_ERROR');
+      const numeric=typeof event.nativeStatusCode==='number'?String(event.nativeStatusCode):'N/A';
+      const missing=Array.isArray(event.missingPermissions)?event.missingPermissions.join(', '):'';
+      const hint=!event.playServicesAvailable?'Google Play services ကို update/enable လုပ်ပါ · Update or enable Google Play services':
+        missing?'Settings မှ Nearby permissions ပေးပါ · Grant Nearby permissions in Settings':
+        event.bluetoothEnabled===false&&event.wifiEnabled===false?'Bluetooth/Wi-Fi ဖွင့်ပါ · Enable Bluetooth/Wi-Fi':
+        'Bluetooth/Wi-Fi စစ်ပြီး ထပ်ကြိုးစားပါ · Check radios and retry';
+      const detail='Nearby '+code+' | Native status: '+numeric+' | '+hint;
+      const target=document.querySelector('#native-state-detail');if(target)target.textContent=detail;
+      const diagnostic=document.querySelector('#native-last-error');if(diagnostic)diagnostic.textContent=detail;
+      const button=document.querySelector('#start-discovery');if(button){button.dataset.running='false';button.innerHTML='<svg><use href="#i-radio"/></svg> စက်ရှာရန်';}
+      toast('Nearby transport ပြဿနာ — '+code);
+      return;
+    }
     if(event.type==='radioDisabled') {
       const button=$('#start-discovery');button.dataset.running='false';button.innerHTML='<svg><use href="#i-radio"/></svg> စက်ရှာရန်';
       $('#native-state-detail').textContent='Wi-Fi သို့မဟုတ် Bluetooth ကို ဖုန်း Settings မှ ကိုယ်တိုင်ဖွင့်ပြီး ထပ်ကြိုးစားပါ။';
