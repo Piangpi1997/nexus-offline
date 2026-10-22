@@ -100,6 +100,12 @@ class MainActivity : Activity() {
     @Volatile private var permissionRequestInProgress = false
     @Volatile private var advertising = false
     @Volatile private var discovering = false
+    private enum class NearbyPhase { STOPPED, STARTING, ACTIVE, STOPPING }
+    private var advertisingPhase = NearbyPhase.STOPPED
+    private var discoveryPhase = NearbyPhase.STOPPED
+    private var advertisingToken = 0L
+    private var discoveryToken = 0L
+    private var lastNearbyError: JSONObject? = null
     @Volatile private var pendingAttachmentMigrationWarning: Int? = null
     private var webPageReady = false
     private val localEndpointName: String
@@ -775,19 +781,77 @@ class MainActivity : Activity() {
     }
 
     private fun startAdvertisingNow() {
-        if (advertising) return
-        val options = AdvertisingOptions.Builder().setStrategy(STRATEGY).build()
-        connections.startAdvertising(localEndpointName, SERVICE_ID, lifecycleCallback, options)
-            .addOnSuccessListener { advertising = true; emitStatus() }
-            .addOnFailureListener { error -> emitFailure("ADVERTISE_FAILED", error) }
+        runOnUiThread {
+            if (advertisingPhase != NearbyPhase.STOPPED) return@runOnUiThread
+            advertisingPhase = NearbyPhase.STARTING
+            val token = ++advertisingToken
+            emitStatus()
+            try {
+                val options = AdvertisingOptions.Builder().setStrategy(STRATEGY).build()
+                connections.startAdvertising(localEndpointName, SERVICE_ID, lifecycleCallback, options)
+                    .addOnSuccessListener {
+                        runOnUiThread {
+                            if (token == advertisingToken) {
+                                advertisingPhase = NearbyPhase.ACTIVE
+                                advertising = true
+                                emitStatus()
+                            }
+                        }
+                    }
+                    .addOnFailureListener { error ->
+                        runOnUiThread {
+                            if (token == advertisingToken) {
+                                advertisingPhase = NearbyPhase.STOPPED
+                                advertising = false
+                                emitFailure("ADVERTISE_FAILED", error)
+                                emitStatus()
+                            }
+                        }
+                    }
+            } catch (error: Exception) {
+                advertisingPhase = NearbyPhase.STOPPED
+                advertising = false
+                emitFailure("ADVERTISE_FAILED", error)
+                emitStatus()
+            }
+        }
     }
 
     private fun startDiscoveryNow() {
-        if (discovering) return
-        val options = DiscoveryOptions.Builder().setStrategy(STRATEGY).build()
-        connections.startDiscovery(SERVICE_ID, discoveryCallback, options)
-            .addOnSuccessListener { discovering = true; emitStatus() }
-            .addOnFailureListener { error -> emitFailure("DISCOVERY_FAILED", error) }
+        runOnUiThread {
+            if (discoveryPhase != NearbyPhase.STOPPED) return@runOnUiThread
+            discoveryPhase = NearbyPhase.STARTING
+            val token = ++discoveryToken
+            emitStatus()
+            try {
+                val options = DiscoveryOptions.Builder().setStrategy(STRATEGY).build()
+                connections.startDiscovery(SERVICE_ID, discoveryCallback, options)
+                    .addOnSuccessListener {
+                        runOnUiThread {
+                            if (token == discoveryToken) {
+                                discoveryPhase = NearbyPhase.ACTIVE
+                                discovering = true
+                                emitStatus()
+                            }
+                        }
+                    }
+                    .addOnFailureListener { error ->
+                        runOnUiThread {
+                            if (token == discoveryToken) {
+                                discoveryPhase = NearbyPhase.STOPPED
+                                discovering = false
+                                emitFailure("DISCOVERY_FAILED", error)
+                                emitStatus()
+                            }
+                        }
+                    }
+            } catch (error: Exception) {
+                discoveryPhase = NearbyPhase.STOPPED
+                discovering = false
+                emitFailure("DISCOVERY_FAILED", error)
+                emitStatus()
+            }
+        }
     }
 
     private val discoveryCallback = object : EndpointDiscoveryCallback() {
@@ -1116,10 +1180,39 @@ class MainActivity : Activity() {
     }
 
     private fun emitFailure(code: String, error: Exception) {
-        if ((error as? ApiException)?.statusCode == ConnectionsStatusCodes.STATUS_RADIO_ERROR) {
-            emit("radioDisabled", JSONObject().put("source", code))
+        val nativeCode = (error as? ApiException)?.statusCode
+        val missing = JSONArray()
+        requiredPermissions().filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }.forEach { missing.put(it) }
+        val bluetoothOn = runCatching {
+            getSystemService(BluetoothManager::class.java)?.adapter?.isEnabled == true
+        }.getOrDefault(false)
+        @Suppress("DEPRECATION")
+        val wifiOn = runCatching {
+            (getSystemService(WIFI_SERVICE) as? WifiManager)?.isWifiEnabled == true
+        }.getOrDefault(false)
+        val details = JSONObject()
+            .put("code", code)
+            .put("operation", when (code) {
+                "ADVERTISE_FAILED" -> "advertising"
+                "DISCOVERY_FAILED" -> "discovery"
+                else -> "connection"
+            })
+            .put("nativeStatusCode", nativeCode ?: JSONObject.NULL)
+            .put("nativeStatusName", nativeCode?.let { "STATUS_$it" } ?: "UNAVAILABLE")
+            .put("timestamp", System.currentTimeMillis())
+            .put("androidApi", Build.VERSION.SDK_INT)
+            .put("missingPermissions", missing)
+            .put("bluetoothEnabled", bluetoothOn)
+            .put("wifiEnabled", wifiOn)
+            .put("playServicesAvailable", googlePlayServicesAvailable())
+        lastNearbyError = JSONObject(details.toString())
+        if (nativeCode == ConnectionsStatusCodes.STATUS_RADIO_ERROR) {
+            emit("radioDisabled", JSONObject(details.toString()).put("source", code))
         } else {
-            emit("transportError", JSONObject().put("code", code).put("message", error.javaClass.simpleName))
+            emit("transportError", JSONObject(details.toString())
+                .put("message", error.javaClass.simpleName))
         }
     }
 
@@ -1695,16 +1788,26 @@ class MainActivity : Activity() {
         }
 
         @JavascriptInterface fun stopAdvertising(): String {
-            connections.stopAdvertising()
-            advertising = false
-            emitStatus()
+            runOnUiThread {
+                advertisingPhase = NearbyPhase.STOPPING
+                ++advertisingToken
+                connections.stopAdvertising()
+                advertising = false
+                advertisingPhase = NearbyPhase.STOPPED
+                emitStatus()
+            }
             return JSONObject().put("ok", true).toString()
         }
 
         @JavascriptInterface fun stopDiscovery(): String {
-            connections.stopDiscovery()
-            discovering = false
-            emitStatus()
+            runOnUiThread {
+                discoveryPhase = NearbyPhase.STOPPING
+                ++discoveryToken
+                connections.stopDiscovery()
+                discovering = false
+                discoveryPhase = NearbyPhase.STOPPED
+                emitStatus()
+            }
             return JSONObject().put("ok", true).toString()
         }
 
@@ -1773,6 +1876,9 @@ class MainActivity : Activity() {
                 .put("buildType", if (debuggable) "debug" else "release")
                 .put("advertising", advertising)
                 .put("discovering", discovering)
+                .put("advertisingState", advertisingPhase.name)
+                .put("discoveryState", discoveryPhase.name)
+                .put("lastNativeError", lastNearbyError ?: JSONObject.NULL)
                 .put("isMock", false)
                 .put("googlePlayServicesAvailable", googlePlayServicesAvailable())
                 .put("nearbyAvailable", googlePlayServicesAvailable())
