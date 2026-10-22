@@ -1,0 +1,47 @@
+name: NEXUS P0 Android Debug
+on:
+  push:
+    branches: [p0-nearby-fix]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  android-debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+          cache-dependency-path: android/**/*.gradle*
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK 35
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - name: JVM tests, lint, and debug APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug
+      - name: Verify APK metadata and checksum
+        if: success()
+        run: |
+          set -euo pipefail
+          APK=android/app/build/outputs/apk/debug/app-debug.apk
+          test -s "$APK"
+          sha256sum "$APK" | tee APK_SHA256.txt
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | grep -E "^(package:|application-label:)" | tee APK_PACKAGE_VERSION.txt
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "$APK" | tee APK_SIGNING.txt
+      - name: Upload APK and metadata
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexus-p0-debug-apk
+          path: |
+            android/app/build/outputs/apk/debug/app-debug.apk
+            APK_SHA256.txt
+            APK_PACKAGE_VERSION.txt
+            APK_SIGNING.txt
+          if-no-files-found: error
