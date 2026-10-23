@@ -1,0 +1,16 @@
+const assert=require('node:assert/strict');
+const {test}=require('node:test');
+const {createRelay}=require('../android/app/src/main/assets/mesh-relay.js');
+const now=1760000000000;
+const msg=(extra={})=>({version:1,messageId:'message_00001',senderId:'sender_00001',recipientId:'target_00001',createdAt:now-1000,expiresAt:now+60000,hopsRemaining:3,ciphertext:'opaque-encrypted-data',signature:'placeholder-signature',...extra});
+const relay=(options={})=>createRelay({nodeId:'relay_000001',now:()=>now,...options});
+test('queue accepts bounded envelope',()=>{const r=relay();assert.equal(r.receive(msg()).status,'QUEUED');assert.equal(r.snapshot().length,1)});
+test('duplicate message rejected',()=>{const r=relay();r.receive(msg());assert.equal(r.receive(msg()).error,'DUPLICATE')});
+test('three-hop simulation decreases hop budget',()=>{const a=relay({nodeId:'relay_000001'}),b=relay({nodeId:'relay_000002'});a.receive(msg());const hop=a.forward('message_00001','relay_000002');assert.equal(hop.envelope.hopsRemaining,2);b.receive(hop.envelope);assert.equal(b.forward('message_00001','target_00001').envelope.hopsRemaining,1)});
+test('zero hop budget blocks relay',()=>{const r=relay();r.receive(msg({hopsRemaining:0}));assert.equal(r.forward('message_00001','relay_000002').error,'HOP_LIMIT')});
+test('queue capacity enforced',()=>{const r=relay({capacity:1});r.receive(msg());assert.equal(r.receive(msg({messageId:'message_00002'})).error,'QUEUE_FULL')});
+test('expired envelope rejected',()=>assert.equal(relay().receive(msg({expiresAt:now})).error,'EXPIRED'));
+test('offer excludes original sender',()=>{const r=relay();r.receive(msg());assert.deepEqual(r.offer('sender_00001'),[]);assert.deepEqual(r.offer('relay_000002'),['message_00001'])});
+test('hop ack is not delivery',()=>{const r=relay();r.receive(msg());r.acknowledge('message_00001');assert.equal(r.snapshot().length,1)});
+test('verified destination ack clears queue',()=>{const r=relay();r.receive(msg());r.acknowledge('message_00001',{destinationVerified:true});assert.equal(r.snapshot().length,0);assert.equal(r.receive(msg()).error,'DUPLICATE')});
+test('expired queue entry purged',()=>{let t=now;const r=relay({now:()=>t});r.receive(msg());t+=60001;assert.equal(r.snapshot().length,0)});
